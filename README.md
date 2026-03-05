@@ -38,15 +38,18 @@ python cf_scanner.py scan --limit 5000
 # Случайные 5000 из миллиона — лучше для поиска незаблокированных
 python cf_scanner.py scan --limit 5000 --random
 
-# Источник Umbrella вместо Tranco
-python cf_scanner.py scan --limit 5000 --random --source umbrella
+# Chrome UX Report — реальная статистика Chrome
+python cf_scanner.py scan --source crux --limit 5000 --random
+
+# Majestic Million
+python cf_scanner.py scan --source majestic --limit 5000 --random
 
 # Только топ-лист, без поиска поддоменов (быстрее)
 python cf_scanner.py scan --limit 10000 --no-subdomains
 ```
 
 Параметры:
-- `--source` — `tranco` (default) или `umbrella`
+- `--source` — `tranco` (default), `umbrella`, `crux`, `majestic`
 - `--limit` — сколько доменов взять из топ-листа (default: 5000)
 - `--random` — случайная выборка вместо первых N
 - `--concurrency` — параллельность (default: 100)
@@ -112,24 +115,36 @@ HTTP статус:  200
 Без автоматического поиска поддоменов. Удобно если нужна быстрая первичная разведка.
 
 ```bash
-# Топ-5000 (самые популярные сайты)
+# Топ-5000 из Tranco
 python cf_scanner.py tranco --limit 5000
 
 # Случайные 5000 из миллиона
 python cf_scanner.py tranco --limit 5000 --random
 
-# Umbrella, больше параллельности
+# Chrome UX Report — данные реального использования в браузере Chrome
+python cf_scanner.py tranco --source crux --limit 5000 --random
+
+# Umbrella с высокой параллельностью
 python cf_scanner.py tranco --source umbrella --limit 10000 --concurrency 150 --random
+
+# Majestic Million — на основе обратных ссылок
+python cf_scanner.py tranco --source majestic --limit 5000 --random
 ```
 
 Параметры:
-- `--source` — `tranco` или `umbrella`
+- `--source` — источник списка (default: `tranco`):
+  - `tranco` — агрегированный топ-лист, обновляется ежедневно
+  - `umbrella` — Cisco Umbrella, на основе DNS-запросов
+  - `crux` — Chrome UX Report, реальная статистика пользователей Chrome от Google
+  - `majestic` — Majestic Million, на основе обратных ссылок
 - `--limit` — сколько доменов (default: 10000)
 - `--random` — случайная выборка вместо топ-N
 - `--concurrency` — параллельных запросов (default: 100)
 - `--output` — файл (default: `results_tranco.json`)
 
-**Топ vs случайные:** первые N доменов из Tranco — это крупнейшие сайты (Google, Meta, Amazon), они чаще заблокированы или имеют нестандартную CF конфигурацию. Случайная выборка из всего миллиона даёт больше шансов найти обычные сайты малого бизнеса, которые стоят на CF и не попали под блокировки.
+Каждый источник имеет несколько зеркал — если основной URL недоступен (заблокирован или timeout), автоматически пробуется следующий зеркальный URL с GitHub.
+
+**Топ vs случайные:** первые N доменов — крупнейшие сайты (Google, Meta, Amazon), они чаще заблокированы или имеют нестандартную CF конфигурацию. Случайная выборка из всего миллиона даёт больше шансов найти обычные сайты малого бизнеса на CF, которые РКН не трогал.
 
 ---
 
@@ -260,12 +275,64 @@ python3 -c "import json; [print(d['domain']) for d in json.load(open('results_sc
 
 ---
 
+## Справочник: источники данных
+
+### Топ-листы доменов
+
+| Источник | Флаг | URL | Размер |
+|---|---|---|---|
+| Tranco | `--source tranco` | https://tranco-list.eu/top-1m.csv.zip | ~10 MB |
+| Cisco Umbrella | `--source umbrella` | http://s3-us-west-1.amazonaws.com/umbrella-static/top-1m.csv.zip | ~10 MB |
+
+### Источники поддоменов (режимы `subdomain` и `scan`)
+
+| Источник | Что даёт | Лимит |
+|---|---|---|
+| crt.sh | Все поддомены из
+
+---
+
 ## Рекомендуемый порядок действий
 
 1. **Запустить автоскан** — `scan --limit 5000 --random`, подождать 10-30 минут
 2. **Проверить результат** — открыть `results_scan.json`, посмотреть найденные домены
 3. **Проверить доступность из РФ** — сканер проверяет с вашей машины. Если запускаете не из РФ — дополнительно проверить через [check-host.net](https://check-host.net) или похожие сервисы
 4. **Использовать в конфиге** — найденный домен прописать как `host` / `sni` в настройках VLESS/Xray
+
+---
+
+## Справочник источников
+
+### Топ-листы доменов
+
+| Источник | `--source` | Основа данных | Зеркало (fallback) |
+|---|---|---|---|
+| Tranco | `tranco` | Агрегат нескольких списков | github.com/adysec/top_1m_domains |
+| Cisco Umbrella | `umbrella` | DNS-запросы через резолверы Cisco | github.com/adysec/top_1m_domains |
+| Chrome UX Report | `crux` | Реальные посещения в браузере Chrome | github.com/zakird/crux-top-lists |
+| Majestic Million | `majestic` | Количество обратных ссылок | github.com/adysec/top_1m_domains |
+
+Если основной URL недоступен или вернул таймаут — скрипт автоматически пробует GitHub-зеркало.
+
+### Источники поддоменов (режимы `subdomain` и `scan`)
+
+| Источник | Что даёт | Лимит |
+|---|---|---|
+| crt.sh | Все поддомены из Certificate Transparency logs | Без лимита |
+| HackerTarget | Все домены на том же IP (reverse IP lookup) | ~100 запросов/день бесплатно |
+| RapidDNS | То же, автоматический fallback если HackerTarget исчерпан | Без лимита, парсинг HTML |
+
+### Cloudflare IP диапазоны (актуальны на момент написания)
+
+```
+103.21.244.0/22      103.22.200.0/22      103.31.4.0/22
+104.16.0.0/13        104.24.0.0/14        108.162.192.0/18
+131.0.72.0/22        141.101.64.0/18      162.158.0.0/15
+172.64.0.0/13        173.245.48.0/20      188.114.96.0/20
+190.93.240.0/20      197.234.240.0/22     198.41.128.0/17
+```
+
+Актуальный список всегда: https://www.cloudflare.com/ips-v4
 
 ---
 

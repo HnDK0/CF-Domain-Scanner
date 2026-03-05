@@ -148,35 +148,123 @@ def save_results(results: list, output: str):
 # Скачивание топ-листов
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Для каждого источника — список URL в порядке приоритета (fallback цепочка).
+# Если первый не отвечает — автоматически пробуется следующий.
+SOURCES = {
+    "tranco": [
+        "https://tranco-list.eu/top-1m.csv.zip",
+        # GitHub зеркало, обновляется ежедневно
+        "https://github.com/adysec/top_1m_domains/raw/main/tranco.zip",
+    ],
+    "umbrella": [
+        "http://s3-us-west-1.amazonaws.com/umbrella-static/top-1m.csv.zip",
+        "https://github.com/adysec/top_1m_domains/raw/main/cisco-umbrella.zip",
+    ],
+    "majestic": [
+        # Majestic Million — колонка 2 (GlobalRank, TldRank, Domain, ...)
+        "https://downloads.majestic.com/majestic_million.csv",
+        "https://github.com/adysec/top_1m_domains/raw/main/majestic.zip",
+    ],
+    "crux": [
+        # Chrome UX Report — самый актуальный, данные Google Chrome
+        # Формат: origin,rank  где origin = "https://example.com"
+        "https://raw.githubusercontent.com/zakird/crux-top-lists/main/data/global/current.csv.gz",
+    ],
+}
+
+
+def _fetch_url(url: str, timeout: int = 45) -> bytes:
+    log(f"  Загружаем: {url}")
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+
+def _parse_zip(data: bytes, domain_col: int = 1) -> list:
+    """Парсит zip с CSV внутри."""
+    z = zipfile.ZipFile(io.BytesIO(data))
+    lines = z.read(z.namelist()[0]).decode(errors="ignore").splitlines()
+    result = []
+    for line in lines:
+        parts = line.split(",")
+        if len(parts) > domain_col:
+            d = parts[domain_col].strip().lower().strip('"')
+            if d and "." in d and not d.startswith("#"):
+                result.append(d)
+    return result
+
+
+def _parse_csv(data: bytes, domain_col: int = 2, skip_header: bool = True) -> list:
+    """Парсит plain CSV без архива."""
+    lines = data.decode(errors="ignore").splitlines()
+    if skip_header and lines:
+        lines = lines[1:]
+    result = []
+    for line in lines:
+        parts = line.split(",")
+        if len(parts) > domain_col:
+            d = parts[domain_col].strip().lower().strip('"')
+            if d and "." in d:
+                result.append(d)
+    return result
+
+
+def _parse_gz_csv(data: bytes) -> list:
+    """Парсит gzip CSV для CrUX. origin = 'https://example.com' → 'example.com'."""
+    import gzip
+    lines = gzip.decompress(data).decode(errors="ignore").splitlines()
+    result = []
+    for line in lines[1:]:  # пропускаем заголовок
+        parts = line.split(",")
+        if parts:
+            raw = parts[0].strip().lower().strip('"')
+            raw = raw.replace("https://", "").replace("http://", "").rstrip("/")
+            if raw and "." in raw:
+                result.append(raw)
+    return result
+
+
 def download_list(source: str, limit: int, use_random: bool) -> list:
-    urls = {
-        "tranco":   "https://tranco-list.eu/top-1m.csv.zip",
-        "umbrella": "http://s3-us-west-1.amazonaws.com/umbrella-static/top-1m.csv.zip",
-    }
-    log(f"Скачиваем {source} top-1M (~10MB)...")
-    try:
-        with urllib.request.urlopen(urls[source], timeout=60) as r:
-            data = r.read()
-        z = zipfile.ZipFile(io.BytesIO(data))
-        lines = z.read(z.namelist()[0]).decode().splitlines()
-
-        all_domains = []
-        for line in lines:
-            parts = line.split(",")
-            if len(parts) >= 2:
-                all_domains.append(parts[1].strip().lower())
-
-        if use_random:
-            selected = random.sample(all_domains, min(limit, len(all_domains)))
-            log(f"Случайная выборка: {len(selected)} из {len(all_domains)} доменов")
-        else:
-            selected = all_domains[:limit]
-            log(f"Топ-{len(selected)} из {len(all_domains)} доменов")
-
-        return selected
-    except Exception as e:
-        log(f"Ошибка загрузки: {e}")
+    urls = SOURCES.get(source)
+    if not urls:
+        log(f"Неизвестный источник: {source}. Доступны: {', '.join(SOURCES)}")
         return []
+
+    log(f"Скачиваем {source} top-1M...")
+    all_domains = []
+
+    for url in urls:
+        try:
+            data = _fetch_url(url)
+
+            if source == "crux":
+                all_domains = _parse_gz_csv(data)
+            elif source == "majestic" and not url.endswith(".zip"):
+                all_domains = _parse_csv(data, domain_col=2, skip_header=True)
+            else:
+                all_domains = _parse_zip(data, domain_col=1)
+
+            if all_domains:
+                log(f"  Успешно: {len(all_domains)} доменов")
+                break
+            else:
+                log("  Файл скачан, но домены не распарсились — пробуем следующий...")
+        except Exception as e:
+            log(f"  Ошибка ({e}) — пробуем следующий источник...")
+            continue
+
+    if not all_domains:
+        log(f"Все источники для '{source}' недоступны")
+        return []
+
+    if use_random:
+        selected = random.sample(all_domains, min(limit, len(all_domains)))
+        log(f"Случайная выборка: {len(selected)} из {len(all_domains)} доменов")
+    else:
+        selected = all_domains[:limit]
+        log(f"Топ-{len(selected)} из {len(all_domains)} доменов")
+
+    return selected
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -549,8 +637,8 @@ def main():
     p.add_argument("--domain", required=True)
 
     # tranco
-    p = sub.add_parser("tranco", help="Сканировать топ-лист Tranco или Umbrella")
-    p.add_argument("--source", choices=["tranco", "umbrella"], default="tranco")
+    p = sub.add_parser("tranco", help="Сканировать топ-лист (tranco/umbrella/majestic/crux)")
+    p.add_argument("--source", choices=["tranco", "umbrella", "majestic", "crux"], default="tranco")
     p.add_argument("--limit", type=int, default=10000, help="Сколько доменов (default: 10000)")
     p.add_argument("--random", action="store_true", help="Случайная выборка вместо топ-N")
     p.add_argument("--concurrency", type=int, default=100)
@@ -580,7 +668,7 @@ def main():
 
     # scan
     p = sub.add_parser("scan", help="Автоскан: топ-лист → CF-домены → поддомены → результат")
-    p.add_argument("--source", choices=["tranco", "umbrella"], default="tranco")
+    p.add_argument("--source", choices=["tranco", "umbrella", "majestic", "crux"], default="tranco")
     p.add_argument("--limit", type=int, default=5000, help="Доменов из топ-листа (default: 5000)")
     p.add_argument("--random", action="store_true", help="Случайная выборка из топ-листа")
     p.add_argument("--concurrency", type=int, default=100)
