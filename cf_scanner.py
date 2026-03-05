@@ -7,16 +7,20 @@ CF Domain Scanner — поиск доменов через Cloudflare для CDN
 
 Примеры запуска:
   python cf_scanner.py check --domain example.com
-  python cf_scanner.py tranco --limit 5000 --concurrency 150
+  python cf_scanner.py tranco --limit 5000
+  python cf_scanner.py tranco --limit 5000 --random
   python cf_scanner.py subdomain --domain example.com
   python cf_scanner.py cfip --range 104.16.0.0/20 --limit 1000
   python cf_scanner.py file --file mylist.txt
+  python cf_scanner.py scan --limit 3000 --random
 """
 
 import asyncio
 import aiohttp
 import argparse
 import json
+import random
+import re
 import socket
 import ipaddress
 import sys
@@ -120,13 +124,13 @@ async def check_domain(session: aiohttp.ClientSession, domain: str, timeout: int
     return result
 
 
-def print_result(r: dict):
+def print_result(r: dict, prefix: str = ""):
     status = r.get("status") or "---"
     ip = r.get("ip") or "no-resolve"
     cf = "[CF]" if r.get("is_cf") else "    "
     ok = "OK" if r.get("http_ok") else "  "
     ray = f" ray={r['cf_ray']}" if r.get("cf_ray") else ""
-    print(f"  {cf} {ok} {r['domain']:<45} {ip:<18} HTTP={status}{ray}", flush=True)
+    print(f"  {prefix}{cf} {ok} {r['domain']:<45} {ip:<18} HTTP={status}{ray}", flush=True)
 
 
 def save_results(results: list, output: str):
@@ -141,10 +145,49 @@ def save_results(results: list, output: str):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Скачивание топ-листов
+# ─────────────────────────────────────────────────────────────────────────────
+
+def download_list(source: str, limit: int, use_random: bool) -> list:
+    urls = {
+        "tranco":   "https://tranco-list.eu/top-1m.csv.zip",
+        "umbrella": "http://s3-us-west-1.amazonaws.com/umbrella-static/top-1m.csv.zip",
+    }
+    log(f"Скачиваем {source} top-1M (~10MB)...")
+    try:
+        with urllib.request.urlopen(urls[source], timeout=60) as r:
+            data = r.read()
+        z = zipfile.ZipFile(io.BytesIO(data))
+        lines = z.read(z.namelist()[0]).decode().splitlines()
+
+        all_domains = []
+        for line in lines:
+            parts = line.split(",")
+            if len(parts) >= 2:
+                all_domains.append(parts[1].strip().lower())
+
+        if use_random:
+            selected = random.sample(all_domains, min(limit, len(all_domains)))
+            log(f"Случайная выборка: {len(selected)} из {len(all_domains)} доменов")
+        else:
+            selected = all_domains[:limit]
+            log(f"Топ-{len(selected)} из {len(all_domains)} доменов")
+
+        return selected
+    except Exception as e:
+        log(f"Ошибка загрузки: {e}")
+        return []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Общий движок сканирования
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def scan_domains(domains: list, concurrency: int, output: str):
+async def scan_domains(domains: list, concurrency: int, output: str, prefix: str = "") -> list:
+    """
+    Проверяет список доменов. Если output=None — не сохраняет в файл.
+    Возвращает список всех результатов.
+    """
     log(f"Проверяем {len(domains)} доменов, параллельность={concurrency}")
     results = []
     sem = asyncio.Semaphore(concurrency)
@@ -161,18 +204,105 @@ async def scan_domains(domains: list, concurrency: int, output: str):
                 done += 1
                 if r["is_cf"] and r["http_ok"]:
                     cf_found += 1
-                    print_result(r)
+                    print_result(r, prefix=prefix)
                 if done % 500 == 0:
                     log(f"Прогресс: {done}/{len(domains)}, CF найдено: {cf_found}")
                 results.append(r)
 
         await asyncio.gather(*[worker(d) for d in domains])
 
-    save_results(results, output)
+    if output:
+        save_results(results, output)
+
+    return results
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Режим: check — одиночная проверка домена
+# Поиск поддоменов (переиспользуется в subdomain и scan)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def fetch_crtsh(session: aiohttp.ClientSession, domain: str) -> list:
+    url = f"https://crt.sh/?q=%.{domain}&output=json"
+    log(f"  crt.sh: сертификаты для *.{domain} ...")
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=40)) as resp:
+            data = await resp.json(content_type=None)
+        subs = set()
+        for entry in data:
+            for name in entry.get("name_value", "").split("\n"):
+                name = name.strip().lower().lstrip("*.")
+                if name.endswith(f".{domain}") or name == domain:
+                    subs.add(name)
+        log(f"  crt.sh нашёл {len(subs)} поддоменов")
+        return list(subs)
+    except Exception as e:
+        log(f"  crt.sh ошибка: {e}")
+        return []
+
+
+async def fetch_hackertarget(session: aiohttp.ClientSession, ip: str) -> list:
+    url = f"https://api.hackertarget.com/reverseiplookup/?q={ip}"
+    log(f"  HackerTarget reverse IP для {ip} ...")
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+            text = await resp.text()
+        if "error" in text.lower() or "no records" in text.lower():
+            log(f"  HackerTarget: {text.strip()}")
+            return []
+        domains = [line.strip() for line in text.splitlines() if line.strip() and "." in line]
+        log(f"  HackerTarget нашёл {len(domains)} доменов на {ip}")
+        return domains
+    except Exception as e:
+        log(f"  HackerTarget ошибка: {e}")
+        return []
+
+
+async def fetch_rapiddns(session: aiohttp.ClientSession, ip: str) -> list:
+    url = f"https://rapiddns.io/sameip/{ip}?full=1"
+    log(f"  RapidDNS reverse IP для {ip} (fallback) ...")
+    try:
+        async with session.get(
+            url,
+            timeout=aiohttp.ClientTimeout(total=30),
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+        ) as resp:
+            text = await resp.text()
+        domains = re.findall(r'<td>([a-zA-Z0-9._-]+\.[a-zA-Z]{2,})</td>', text)
+        domains = list(set(domains))
+        log(f"  RapidDNS нашёл {len(domains)} доменов на {ip}")
+        return domains
+    except Exception as e:
+        log(f"  RapidDNS ошибка: {e}")
+        return []
+
+
+async def collect_subdomains(domain: str, ip: str, session: aiohttp.ClientSession,
+                             seen_ips: set) -> set:
+    """
+    Собирает поддомены и соседей по IP для одного домена.
+    seen_ips — уже обработанные IP, чтобы не дублировать reverse IP запросы.
+    """
+    found = set([domain])
+
+    # crt.sh — всегда
+    crt = await fetch_crtsh(session, domain)
+    found.update(crt)
+
+    # Reverse IP — один раз на уникальный IP
+    if ip and ip not in seen_ips:
+        seen_ips.add(ip)
+        ht = await fetch_hackertarget(session, ip)
+        if ht:
+            found.update(ht)
+        else:
+            rd = await fetch_rapiddns(session, ip)
+            found.update(rd)
+
+    return found
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Режим: check
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def mode_check(args):
@@ -196,35 +326,11 @@ async def mode_check(args):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Режим: tranco — сканирование топ-листа
+# Режим: tranco
 # ─────────────────────────────────────────────────────────────────────────────
 
-def download_list(source: str, limit: int) -> list:
-    urls = {
-        "tranco": "https://tranco-list.eu/top-1m.csv.zip",
-        "umbrella": "http://s3-us-west-1.amazonaws.com/umbrella-static/top-1m.csv.zip",
-    }
-    url = urls[source]
-    log(f"Скачиваем {source} top-1M (~10MB)...")
-    try:
-        with urllib.request.urlopen(url, timeout=60) as r:
-            data = r.read()
-        z = zipfile.ZipFile(io.BytesIO(data))
-        lines = z.read(z.namelist()[0]).decode().splitlines()
-        domains = []
-        for line in lines[:limit]:
-            parts = line.split(",")
-            if len(parts) >= 2:
-                domains.append(parts[1].strip().lower())
-        log(f"Загружено {len(domains)} доменов")
-        return domains
-    except Exception as e:
-        log(f"Ошибка загрузки: {e}")
-        return []
-
-
 async def mode_tranco(args):
-    domains = download_list(args.source, args.limit)
+    domains = download_list(args.source, args.limit, args.random)
     if not domains:
         log("Не удалось загрузить домены")
         return
@@ -232,117 +338,97 @@ async def mode_tranco(args):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Режим: subdomain — поиск поддоменов через crt.sh + reverse IP lookup
+# Режим: subdomain
 # ─────────────────────────────────────────────────────────────────────────────
-
-async def fetch_crtsh(session: aiohttp.ClientSession, domain: str) -> list:
-    """
-    Certificate Transparency logs — все поддомены которые когда-либо
-    получали TLS-сертификат. Очень полный источник.
-    """
-    url = f"https://crt.sh/?q=%.{domain}&output=json"
-    log(f"crt.sh: запрашиваем сертификаты для *.{domain} ...")
-    try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=40)) as resp:
-            data = await resp.json(content_type=None)
-        subs = set()
-        for entry in data:
-            for name in entry.get("name_value", "").split("\n"):
-                name = name.strip().lower().lstrip("*.")
-                if name.endswith(f".{domain}") or name == domain:
-                    subs.add(name)
-        log(f"crt.sh нашёл {len(subs)} поддоменов")
-        return list(subs)
-    except Exception as e:
-        log(f"crt.sh ошибка: {e}")
-        return []
-
-
-async def fetch_hackertarget_reverseip(session: aiohttp.ClientSession, ip: str) -> list:
-    """
-    HackerTarget Reverse IP — возвращает все домены на данном IP.
-    Бесплатный API без ключа, лимит ~100 запросов/день.
-    На одном CF IP обычно тысячи доменов — это золотая жила.
-    """
-    url = f"https://api.hackertarget.com/reverseiplookup/?q={ip}"
-    log(f"HackerTarget reverse IP: ищем домены на {ip} ...")
-    try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
-            text = await resp.text()
-        # API возвращает домены построчно, или "error" / "API count exceeded"
-        if "error" in text.lower() or "no records" in text.lower():
-            log(f"HackerTarget: {text.strip()}")
-            return []
-        domains = [line.strip() for line in text.splitlines() if line.strip() and "." in line]
-        log(f"HackerTarget нашёл {len(domains)} доменов на IP {ip}")
-        return domains
-    except Exception as e:
-        log(f"HackerTarget ошибка: {e}")
-        return []
-
-
-async def fetch_rapiddns_reverseip(session: aiohttp.ClientSession, ip: str) -> list:
-    """
-    RapidDNS — альтернатива HackerTarget для reverse IP lookup.
-    Используется как fallback если HackerTarget вернул ошибку лимита.
-    """
-    url = f"https://rapiddns.io/sameip/{ip}?full=1"
-    log(f"RapidDNS reverse IP: ищем домены на {ip} ...")
-    try:
-        async with session.get(
-            url,
-            timeout=aiohttp.ClientTimeout(total=30),
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
-        ) as resp:
-            text = await resp.text()
-        # Парсим домены из HTML таблицы — они в тегах <td>
-        import re
-        domains = re.findall(r'<td>([a-zA-Z0-9._-]+\.[a-zA-Z]{2,})</td>', text)
-        domains = list(set(domains))
-        log(f"RapidDNS нашёл {len(domains)} доменов на IP {ip}")
-        return domains
-    except Exception as e:
-        log(f"RapidDNS ошибка: {e}")
-        return []
-
 
 async def mode_subdomain(args):
     domain = args.domain.lower().strip()
-    all_subs = set([domain])
+    ip = await resolve(domain)
+    seen_ips = set()
 
     connector = aiohttp.TCPConnector(ssl=False)
     async with aiohttp.ClientSession(connector=connector) as session:
-
-        # 1. crt.sh — Certificate Transparency
-        crt_subs = await fetch_crtsh(session, domain)
-        all_subs.update(crt_subs)
-
-        # 2. Резолвим IP базового домена и делаем reverse IP lookup
-        ip = await resolve(domain)
-        if ip:
-            log(f"IP домена {domain}: {ip}")
-            if is_cf_ip(ip):
-                log("IP в диапазоне Cloudflare — делаем reverse IP lookup")
-
-                # Пробуем HackerTarget
-                ht_domains = await fetch_hackertarget_reverseip(session, ip)
-                if ht_domains:
-                    all_subs.update(ht_domains)
-                else:
-                    # Fallback — RapidDNS
-                    rd_domains = await fetch_rapiddns_reverseip(session, ip)
-                    all_subs.update(rd_domains)
-            else:
-                log(f"IP {ip} не в диапазоне CF — reverse IP lookup пропускаем")
-        else:
-            log(f"Не удалось резолвить {domain}")
+        all_subs = await collect_subdomains(domain, ip, session, seen_ips)
 
     log(f"Итого уникальных доменов для проверки: {len(all_subs)}")
     await scan_domains(list(all_subs), args.concurrency, args.output)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Режим: cfip — сканирование IP подсетей Cloudflare через reverse DNS
+# Режим: scan — полный автопилот
+#
+#  Фаза 1: скачать топ-лист → проверить все домены → выбрать CF-домены
+#  Фаза 2: для каждого CF-домена → crt.sh + reverse IP → собрать новые домены
+#          (уникальные IP не дублируются)
+#  Итог:   объединить результаты обеих фаз → сохранить
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def mode_scan(args):
+    log("=" * 60)
+    log("АВТОСКАНИРОВАНИЕ")
+    log(f"  Источник:      {args.source}")
+    log(f"  Доменов:       {args.limit} ({'случайные' if args.random else 'топ'})")
+    log(f"  Параллельность:{args.concurrency}")
+    log(f"  Поддомены:     {'нет (--no-subdomains)' if args.no_subdomains else 'да'}")
+    log(f"  Результат:     {args.output}")
+    log("=" * 60)
+
+    # ── Фаза 1 ───────────────────────────────────────────────────────────
+    log("\n[Фаза 1] Скачиваем топ-лист и ищем CF-домены...")
+    domains = download_list(args.source, args.limit, args.random)
+    if not domains:
+        log("Не удалось загрузить домены")
+        return
+
+    phase1_results = await scan_domains(domains, args.concurrency, output=None, prefix="[1] ")
+    cf_found_p1 = [r for r in phase1_results if r["is_cf"] and r["http_ok"]]
+    log(f"\n[Фаза 1] Найдено {len(cf_found_p1)} рабочих CF-доменов")
+
+    if not cf_found_p1 or args.no_subdomains:
+        save_results(phase1_results, args.output)
+        return
+
+    # ── Фаза 2 ───────────────────────────────────────────────────────────
+    log(f"\n[Фаза 2] Собираем поддомены/соседей для {len(cf_found_p1)} CF-доменов...")
+
+    seen_ips = set()
+    all_extra = set()
+
+    connector = aiohttp.TCPConnector(ssl=False)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        for r in cf_found_p1:
+            log(f"\n  → {r['domain']} ({r['ip']})")
+            extra = await collect_subdomains(r["domain"], r["ip"], session, seen_ips)
+            all_extra.update(extra)
+
+    already_checked = {r["domain"] for r in phase1_results}
+    new_domains = list(all_extra - already_checked)
+    log(f"\n[Фаза 2] Новых доменов для проверки: {len(new_domains)}")
+
+    if not new_domains:
+        save_results(phase1_results, args.output)
+        return
+
+    phase2_results = await scan_domains(new_domains, args.concurrency, output=None, prefix="[2] ")
+
+    # ── Итог ─────────────────────────────────────────────────────────────
+    all_results = phase1_results + phase2_results
+    save_results(all_results, args.output)
+
+    cf_p2 = [r for r in phase2_results if r["is_cf"] and r["http_ok"]]
+    cf_total = len(cf_found_p1) + len(cf_p2)
+
+    log(f"\n{'=' * 60}")
+    log(f"ИТОГО:")
+    log(f"  Фаза 1 — топ-лист:  проверено {len(phase1_results)}, CF={len(cf_found_p1)}")
+    log(f"  Фаза 2 — поддомены: проверено {len(phase2_results)}, CF={len(cf_p2)}")
+    log(f"  Всего рабочих CF:   {cf_total}")
+    log(f"  Файл:               {args.output}")
+    log(f"{'=' * 60}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Режим: cfip
 # ─────────────────────────────────────────────────────────────────────────────
 
 def reverse_dns(ip: str):
@@ -352,7 +438,7 @@ def reverse_dns(ip: str):
         return None
 
 
-async def scan_cfip_range(ip_range: str, limit: int, concurrency: int, output: str):
+async def scan_cfip_range(ip_range: str, limit: int, use_random: bool, concurrency: int, output: str):
     try:
         network = ipaddress.ip_network(ip_range, strict=False)
     except ValueError:
@@ -360,10 +446,13 @@ async def scan_cfip_range(ip_range: str, limit: int, concurrency: int, output: s
         return
 
     hosts = list(network.hosts())
-    if limit:
-        hosts = hosts[:limit]
 
-    log(f"Сканируем {len(hosts)} IP в диапазоне {ip_range} (reverse DNS)")
+    if use_random:
+        hosts = random.sample(hosts, min(limit, len(hosts)))
+        log(f"Случайная выборка: {len(hosts)} IP из {network.num_addresses:,} в {ip_range}")
+    else:
+        hosts = hosts[:limit]
+        log(f"Первые {len(hosts)} IP из {network.num_addresses:,} в {ip_range}")
 
     sem = asyncio.Semaphore(concurrency)
     found_domains = set()
@@ -376,7 +465,7 @@ async def scan_cfip_range(ip_range: str, limit: int, concurrency: int, output: s
             domain = await loop.run_in_executor(None, reverse_dns, str(ip))
             done += 1
             if done % 100 == 0:
-                log(f"  rDNS прогресс: {done}/{len(hosts)}, доменов: {len(found_domains)}")
+                log(f"  rDNS: {done}/{len(hosts)}, доменов: {len(found_domains)}")
             if domain:
                 found_domains.add(domain)
                 log(f"  PTR {ip} -> {domain}")
@@ -404,11 +493,11 @@ async def mode_cfip(args):
         except (ValueError, IndexError):
             ip_range = choice
 
-    await scan_cfip_range(ip_range, args.limit, args.concurrency, args.output)
+    await scan_cfip_range(ip_range, args.limit, args.random, args.concurrency, args.output)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Режим: file — проверить свой список доменов
+# Режим: file
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def mode_file(args):
@@ -416,8 +505,18 @@ async def mode_file(args):
         log(f"Файл не найден: {args.file}")
         return
     with open(args.file, encoding="utf-8") as f:
-        domains = [line.strip() for line in f if line.strip() and not line.startswith("#")]
-    log(f"Загружено {len(domains)} доменов из {args.file}")
+        all_domains = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+
+    if args.random and args.limit:
+        domains = random.sample(all_domains, min(args.limit, len(all_domains)))
+        log(f"Случайная выборка: {len(domains)} из {len(all_domains)} доменов")
+    elif args.limit:
+        domains = all_domains[:args.limit]
+        log(f"Первые {len(domains)} из {len(all_domains)} доменов")
+    else:
+        domains = all_domains
+        log(f"Загружено {len(domains)} доменов из {args.file}")
+
     await scan_domains(domains, args.concurrency, args.output)
 
 
@@ -432,11 +531,15 @@ def main():
         epilog="""
 Примеры:
   python cf_scanner.py check --domain example.com
-  python cf_scanner.py tranco --limit 5000 --concurrency 150
-  python cf_scanner.py tranco --source umbrella --limit 10000
+  python cf_scanner.py tranco --limit 5000
+  python cf_scanner.py tranco --limit 5000 --random
+  python cf_scanner.py tranco --source umbrella --limit 10000 --random
   python cf_scanner.py subdomain --domain example.com
-  python cf_scanner.py cfip --range 104.16.0.0/20 --limit 500
-  python cf_scanner.py file --file mylist.txt --output my_results.json
+  python cf_scanner.py cfip --range 104.16.0.0/20 --limit 500 --random
+  python cf_scanner.py file --file mylist.txt --limit 500 --random
+  python cf_scanner.py scan --limit 3000
+  python cf_scanner.py scan --limit 5000 --random --source umbrella
+  python cf_scanner.py scan --limit 5000 --no-subdomains
         """
     )
     sub = parser.add_subparsers(dest="mode", required=True)
@@ -449,6 +552,7 @@ def main():
     p = sub.add_parser("tranco", help="Сканировать топ-лист Tranco или Umbrella")
     p.add_argument("--source", choices=["tranco", "umbrella"], default="tranco")
     p.add_argument("--limit", type=int, default=10000, help="Сколько доменов (default: 10000)")
+    p.add_argument("--random", action="store_true", help="Случайная выборка вместо топ-N")
     p.add_argument("--concurrency", type=int, default=100)
     p.add_argument("--output", default="results_tranco.json")
 
@@ -462,14 +566,27 @@ def main():
     p = sub.add_parser("cfip", help="Сканировать IP-подсети Cloudflare (reverse DNS)")
     p.add_argument("--range", default=None, help="CIDR, например 104.16.0.0/20")
     p.add_argument("--limit", type=int, default=1000, help="Макс. IP (default: 1000)")
+    p.add_argument("--random", action="store_true", help="Случайные IP из диапазона")
     p.add_argument("--concurrency", type=int, default=50)
     p.add_argument("--output", default="results_cfip.json")
 
     # file
     p = sub.add_parser("file", help="Проверить список доменов из файла")
     p.add_argument("--file", required=True)
+    p.add_argument("--limit", type=int, default=None, help="Лимит (опционально)")
+    p.add_argument("--random", action="store_true", help="Случайная выборка из файла")
     p.add_argument("--concurrency", type=int, default=100)
     p.add_argument("--output", default="results_file.json")
+
+    # scan
+    p = sub.add_parser("scan", help="Автоскан: топ-лист → CF-домены → поддомены → результат")
+    p.add_argument("--source", choices=["tranco", "umbrella"], default="tranco")
+    p.add_argument("--limit", type=int, default=5000, help="Доменов из топ-листа (default: 5000)")
+    p.add_argument("--random", action="store_true", help="Случайная выборка из топ-листа")
+    p.add_argument("--concurrency", type=int, default=100)
+    p.add_argument("--no-subdomains", action="store_true", dest="no_subdomains",
+                   help="Пропустить фазу поиска поддоменов (только топ-лист)")
+    p.add_argument("--output", default="results_scan.json")
 
     args = parser.parse_args()
 
@@ -477,11 +594,12 @@ def main():
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
     dispatch = {
-        "check": mode_check,
-        "tranco": mode_tranco,
+        "check":     mode_check,
+        "tranco":    mode_tranco,
         "subdomain": mode_subdomain,
-        "cfip": mode_cfip,
-        "file": mode_file,
+        "cfip":      mode_cfip,
+        "file":      mode_file,
+        "scan":      mode_scan,
     }
     asyncio.run(dispatch[args.mode](args))
 
