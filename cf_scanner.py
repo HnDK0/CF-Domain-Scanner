@@ -25,7 +25,6 @@ import gzip
 import zipfile
 import time
 import errno
-import socket
 import urllib.request
 from datetime import datetime
 from typing import Optional, Tuple, List
@@ -443,7 +442,6 @@ async def _step3_tls(domain: str) -> Tuple[bool, str]:
 
     Возвращает (ok: bool, reason: str).
     """
-    loop = asyncio.get_event_loop()
     try:
         ctx = ssl.create_default_context()
         # Проверяем сертификат по-настоящему

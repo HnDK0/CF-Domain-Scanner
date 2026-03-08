@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-CF Domain Scanner — поиск CF-доменов для CDN VLESS fronting в РФ
+CF Domain Scanner Lite — поиск CF-доменов для CDN VLESS fronting в РФ
+Облегчённая версия без X-Pad ТСПУ-теста. Зависимости: aiohttp, aiodns.
 
 Установка зависимостей:
   pip install aiohttp aiodns
 
 Примеры:
-  python cf_scanner.py check --domain example.com
-  python cf_scanner.py tranco --limit 5000 --random
-  python cf_scanner.py tranco --source umbrella --limit 10000
-  python cf_scanner.py file --file mylist.txt
+  python cf_scanner_lite.py check --domain example.com
+  python cf_scanner_lite.py tranco --limit 5000 --random
+  python cf_scanner_lite.py tranco --source umbrella --limit 10000
+  python cf_scanner_lite.py file --file mylist.txt
 """
 
 import asyncio
@@ -25,7 +26,6 @@ import gzip
 import zipfile
 import time
 import errno
-import socket
 import urllib.request
 from datetime import datetime
 from typing import Optional, Tuple, List
@@ -357,12 +357,11 @@ async def _step1_get(
 
 async def _step3_tls(domain: str) -> Tuple[bool, str]:
     """
-    Шаг 3: TLS-проверка — детект MITM, SNI-блокировки, TLS version блокировок.
+    Шаг 2 (lite): TLS-проверка — детект MITM, SNI-блокировки, TLS version блокировок.
     Новое TCP-соединение с реальной проверкой сертификата.
 
     Возвращает (ok: bool, reason: str).
     """
-    loop = asyncio.get_event_loop()
     try:
         ctx = ssl.create_default_context()
         # Проверяем сертификат по-настоящему
@@ -485,8 +484,7 @@ async def check_domain(
         result["elapsed"] = time.time() - t_start
         return result
 
-    # ── Шаг 2: TLS ────────────────────────────────────────────────────────────
-    if not skip_tls:
+    # ── Шаг 2: TLS ────────────────────────────────────────────────────────────    if not skip_tls:
         tls_ok, tls_reason = await _step3_tls(domain)
         result["tls_ok"]     = tls_ok
         result["tls_reason"] = tls_reason
@@ -539,7 +537,6 @@ class ResultWriter:
             f"status={r['status']} bytes={kb}KB "
             f"elapsed={r['elapsed']:.2f}s "
             f"cf={r.get('cf_detection','')} "
-
             f"tls={'ok' if r['tls_ok'] else r.get('tls_reason','skip')}"
         )
         self._flush()
@@ -768,7 +765,7 @@ async def mode_check(args):
     else:
         print(f"  GET /       ✗ {r['dead_reason']}")
 
-    # Шаг 2
+    # Шаг 2 (только TLS — X-Pad отсутствует в lite)
     if r["tls_ok"] is True:
         print(f"  TLS         ✓ Сертификат валиден, нет MITM/SNI-блок")
     elif r["tls_ok"] is False:
@@ -830,11 +827,11 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Примеры:
-  python cf_scanner.py check --domain example.com
-  python cf_scanner.py tranco --limit 5000 --random
-  python cf_scanner.py tranco --source umbrella --limit 10000
-  python cf_scanner.py file --file mylist.txt
-  python cf_scanner.py file --file mylist.txt --skip-tls
+  python cf_scanner_lite.py check --domain example.com
+  python cf_scanner_lite.py tranco --limit 5000 --random
+  python cf_scanner_lite.py tranco --source umbrella --limit 10000
+  python cf_scanner_lite.py file --file mylist.txt
+  python cf_scanner_lite.py file --file mylist.txt --skip-tls
         """,
     )
     sub = parser.add_subparsers(dest="mode", required=True)
